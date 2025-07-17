@@ -19,9 +19,16 @@ namespace base::memory
     inline NTSTATUS(NTAPI* syscall_NtReadVirtualMemory)(HANDLE, PVOID, PVOID, ULONG, PULONG) = nullptr;
     inline NTSTATUS(NTAPI* syscall_NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, ULONG, PULONG) = nullptr;
 
+    inline NTSTATUS(NTAPI* ZwReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T) = nullptr;
+    inline NTSTATUS(NTAPI* ZwWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T) = nullptr;
+
     inline INT32 FindProcess(LPCTSTR processName) {
         PROCESSENTRY32 processEntry{};
         HANDLE handleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (handleSnap == INVALID_HANDLE_VALUE) {
+            std::cout << "[-] failed to create snapshot" << std::endl;
+            return 0;
+        }
         processEntry.dwSize = sizeof(PROCESSENTRY32);
 
         if (Process32First(handleSnap, &processEntry)) {
@@ -38,21 +45,26 @@ namespace base::memory
 
     inline uintptr_t GetProcessBase() {
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, PID);
-        if (hProcess == NULL)
-            throw std::runtime_error("failed to open process to get base");
+        if (hProcess == nullptr) {
+            std::cout << "[-] failed to open process to get base" << std::endl;
+            return 0;
+        }
 
         HMODULE handleModules[1024];
-        DWORD BytesNeeded;
+        DWORD BytesNeeded = 0;
 
-        if (EnumProcessModules(hProcess, handleModules, sizeof(handleModules), &BytesNeeded)) {
-            uintptr_t baseAddy = (uintptr_t)handleModules[0];
-            CloseHandle(hProcess);
-            return baseAddy;
+        uintptr_t baseAddy = 0;
+        if (EnumProcessModules(hProcess, handleModules, sizeof(handleModules), &BytesNeeded) && BytesNeeded > 0) {
+            baseAddy = reinterpret_cast<uintptr_t>(handleModules[0]);
         }
         else {
+            std::cout << "[-] failed to enumerate modules" << std::endl;
             CloseHandle(hProcess);
-            throw std::runtime_error("failed to enumerate modules");
+            return 0;
         }
+
+        CloseHandle(hProcess);
+        return baseAddy;
     }
 
     inline bool IsValid(uintptr_t address) {
@@ -76,17 +88,16 @@ namespace base::memory
         return page;
     }
 
-    inline uint32_t GetSyscallID(const char* funcName)
-    {
+    inline uint32_t GetSyscallID(const char* funcName) {
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         if (!ntdll) return 0;
 
-        unsigned char* funcAddr = (unsigned char*)GetProcAddress(ntdll, funcName);
+        unsigned char* funcAddr = reinterpret_cast<unsigned char*>(GetProcAddress(ntdll, funcName));
         if (!funcAddr) return 0;
 
         for (int i = 0; i < 20; i++) {
             if (funcAddr[i] == 0xB8) {
-                return *(uint32_t*)(funcAddr + i + 1);
+                return *reinterpret_cast<uint32_t*>(funcAddr + i + 1);
             }
         }
         return 0;
@@ -112,33 +123,38 @@ namespace base::memory
         uint32_t readSyscallId = GetSyscallID("NtReadVirtualMemory");
         if (readSyscallId == 0) {
             std::cout << "[-] failed to get syscall ID for NtReadVirtualMemory" << std::endl;
-            syscall_NtReadVirtualMemory = nullptr;
+            return;
         }
-        else {
-            syscallReadStubPtr = CreateSyscallStub(readSyscallId);
-            if (!syscallReadStubPtr) {
-                std::cout << "[-] failed to create syscall_read stub" << std::endl;
-                syscall_NtReadVirtualMemory = nullptr;
-            }
-            else {
-                syscall_NtReadVirtualMemory = reinterpret_cast<decltype(syscall_NtReadVirtualMemory)>(syscallReadStubPtr);
-            }
+        syscallReadStubPtr = CreateSyscallStub(readSyscallId);
+        if (!syscallReadStubPtr) {
+            std::cout << "[-] failed to create syscall_read stub" << std::endl;
+            return;
         }
+        syscall_NtReadVirtualMemory = reinterpret_cast<decltype(syscall_NtReadVirtualMemory)>(syscallReadStubPtr);
 
         uint32_t writeSyscallId = GetSyscallID("NtWriteVirtualMemory");
         if (writeSyscallId == 0) {
             std::cout << "[-] failed to get syscall ID for NtWriteVirtualMemory" << std::endl;
-            syscall_NtWriteVirtualMemory = nullptr;
+            return;
         }
-        else {
-            syscallWriteStubPtr = CreateSyscallStub(writeSyscallId);
-            if (!syscallWriteStubPtr) {
-                std::cout << "[-] failed to create syscall_write stub" << std::endl;
-                syscall_NtWriteVirtualMemory = nullptr;
-            }
-            else {
-                syscall_NtWriteVirtualMemory = reinterpret_cast<decltype(syscall_NtWriteVirtualMemory)>(syscallWriteStubPtr);
-            }
+        syscallWriteStubPtr = CreateSyscallStub(writeSyscallId);
+        if (!syscallWriteStubPtr) {
+            std::cout << "[-] failed to create syscall_write stub" << std::endl;
+            return;
+        }
+        syscall_NtWriteVirtualMemory = reinterpret_cast<decltype(syscall_NtWriteVirtualMemory)>(syscallWriteStubPtr);
+
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (!ntdll) {
+            std::cout << "[-] failed to get ntdll.dll module" << std::endl;
+            return;
+        }
+
+        ZwReadVirtualMemory = reinterpret_cast<decltype(ZwReadVirtualMemory)>(GetProcAddress(ntdll, "ZwReadVirtualMemory"));
+        ZwWriteVirtualMemory = reinterpret_cast<decltype(ZwWriteVirtualMemory)>(GetProcAddress(ntdll, "ZwWriteVirtualMemory"));
+        if (!ZwReadVirtualMemory || !ZwWriteVirtualMemory) {
+            std::cout << "[-] failed to get Zw functions" << std::endl;
+            return;
         }
 
         syscallInitialized = true;
@@ -146,19 +162,22 @@ namespace base::memory
 
     template <typename T>
     T read(uint64_t addy) {
+        if (!syscallInitialized) EnsureSyscallInit();
+
         static const auto NtReadVirtualMemory = reinterpret_cast<NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T)>(
             GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtReadVirtualMemory")
             );
 
         T buffer{};
         SIZE_T bytesRead{};
-        NtReadVirtualMemory(base::memory::handleProcess, reinterpret_cast<PVOID>(addy), &buffer, sizeof(T), &bytesRead);
+        if (NtReadVirtualMemory && handleProcess)
+            NtReadVirtualMemory(handleProcess, reinterpret_cast<PVOID>(addy), &buffer, sizeof(T), &bytesRead);
         return buffer;
     }
 
     template <typename T>
     T syscall_read(uint64_t address) {
-        EnsureSyscallInit();
+        if (!syscallInitialized) EnsureSyscallInit();
 
         T buffer{};
         SIZE_T bytesRead = 0;
@@ -168,7 +187,7 @@ namespace base::memory
             return buffer;
         }
 
-        NTSTATUS status = syscall_NtReadVirtualMemory(
+        syscall_NtReadVirtualMemory(
             handleProcess,
             reinterpret_cast<PVOID>(address),
             &buffer,
@@ -179,11 +198,38 @@ namespace base::memory
         return buffer;
     }
 
+    template <typename T>
+    T zw_read(uint64_t address) {
+        if (!syscallInitialized) EnsureSyscallInit();
+
+        T buffer{};
+        SIZE_T bytesRead = 0;
+
+        if (!handleProcess || !ZwReadVirtualMemory) {
+            std::cout << "[-] zw_read invalid" << std::endl;
+            return buffer;
+        }
+
+        ZwReadVirtualMemory(
+            handleProcess,
+            reinterpret_cast<PVOID>(address),
+            &buffer,
+            sizeof(T),
+            &bytesRead
+        );
+
+        return buffer;
+    }
+
     inline NTSTATUS(NTAPI* NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T) =
         reinterpret_cast<decltype(NtWriteVirtualMemory)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWriteVirtualMemory"));
 
     __forceinline bool write_bytes(uint64_t address, const void* buffer, size_t size) {
-        if (!NtWriteVirtualMemory || !handleProcess) return false;
+        if (!syscallInitialized) EnsureSyscallInit();
+
+        if (!NtWriteVirtualMemory || !handleProcess)
+            return false;
+
         SIZE_T bytesWritten{};
         NTSTATUS status = NtWriteVirtualMemory(handleProcess, (PVOID)address, (PVOID)buffer, size, &bytesWritten);
         return status >= 0 && bytesWritten == size;
@@ -196,7 +242,7 @@ namespace base::memory
 
     template <typename T>
     bool syscall_write(uint64_t address, const T& buffer) {
-        EnsureSyscallInit();
+        if (!syscallInitialized) EnsureSyscallInit();
 
         if (!handleProcess || !syscall_NtWriteVirtualMemory) {
             std::cout << "[-] syscall_write invalid" << std::endl;
@@ -204,7 +250,7 @@ namespace base::memory
         }
 
         SIZE_T bytesWritten = 0;
-        NTSTATUS status = syscall_NtWriteVirtualMemory(
+        syscall_NtWriteVirtualMemory(
             handleProcess,
             reinterpret_cast<PVOID>(address),
             (PVOID)&buffer,
@@ -215,4 +261,24 @@ namespace base::memory
         return true;
     }
 
+    template <typename T>
+    bool zw_write(uint64_t address, const T& buffer) {
+        if (!syscallInitialized) EnsureSyscallInit();
+
+        if (!handleProcess || !ZwWriteVirtualMemory) {
+            std::cout << "[-] zw_write invalid" << std::endl;
+            return false;
+        }
+
+        SIZE_T bytesWritten = 0;
+        ZwWriteVirtualMemory(
+            handleProcess,
+            reinterpret_cast<PVOID>(address),
+            (PVOID)&buffer,
+            sizeof(T),
+            &bytesWritten
+        );
+
+        return (bytesWritten == sizeof(T));
+    }
 }
