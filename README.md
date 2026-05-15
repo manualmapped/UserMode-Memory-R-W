@@ -30,7 +30,7 @@ This means:
 
 ```cpp
 int main() {
-    base::memory::PID = base::memory::FindProcess(L"RobloxPlayerBeta.exe");
+    base::memory::PID = base::memory::FindProcess(L"notepad.exe");
     base::memory::base = base::memory::GetProcessBase();
 
     std::cout << std::hex << "[+] Base: 0x" << base::memory::base << std::endl;
