@@ -93,7 +93,7 @@ The remaining latency is almost entirely the kernel transition itself.
 # Quick Start
 
 ```cpp
-#include "updated_memory.h"
+#include "memory.h"
 #include <cstdio>
 
 int main()
