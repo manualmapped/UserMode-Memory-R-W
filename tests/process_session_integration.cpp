@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <utility>
+#include <vector>
 
 static_assert(sizeof(void*) == 8, "This integration test requires Windows x64.");
 
@@ -72,19 +73,30 @@ int main(int argc, char** argv)
         !mem::is_valid_range(mem::MIN_ADDRESS, 0)))
         return fail(1, "address range validation failed");
 
-    char executable[MAX_PATH]{};
-    if (!GetModuleFileNameA(nullptr, executable, MAX_PATH))
-        return fail(2, "could not locate the integration executable");
+    std::vector<char> executable(512);
+    DWORD executable_length = 0;
+    for (;;)
+    {
+        const DWORD capacity = static_cast<DWORD>(executable.size());
+        executable_length = GetModuleFileNameA(nullptr, executable.data(), capacity);
+        if (executable_length == 0)
+            return fail(2, "could not locate the integration executable");
+        if (executable_length < capacity) break;
+        if (executable.size() >= 32768)
+            return fail(33, "integration executable path exceeds the supported Windows path limit");
+        executable.resize(executable.size() >= 16384 ? 32768 : executable.size() * 2);
+    }
+    const std::string executable_path(executable.data(), executable_length);
 
     const std::string event_name = "Local\\umrw-ready-" + std::to_string(GetCurrentProcessId());
     ChildProcess child;
     child.ready_event = CreateEventA(nullptr, TRUE, FALSE, event_name.c_str());
     if (!child.ready_event) return fail(3, "could not create child readiness event");
 
-    std::string command = std::string("\"") + executable + "\" --child \"" + event_name + "\"";
+    std::string command = std::string("\"") + executable_path + "\" --child \"" + event_name + "\"";
     STARTUPINFOA startup{};
     startup.cb = sizeof(startup);
-    if (!CreateProcessA(executable, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+    if (!CreateProcessA(executable_path.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
         nullptr, nullptr, &startup, &child.process))
         return fail(4, "could not launch the test child");
     if (WaitForSingleObject(child.ready_event, 5000) != WAIT_OBJECT_0)
