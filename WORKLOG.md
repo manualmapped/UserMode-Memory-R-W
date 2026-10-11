@@ -44,3 +44,5 @@ Review and commit the uncommitted setup files in the nested project checkout bef
 - Limitation: SDK events do not expose a child agent's configured identity. The runner documents and reports this accurately; the marker-bearing completion plus model-reported Sam review remains advisory, with human GitHub review required.
 - Follow-up checks on the setup branch: `node --check scripts/codex-team.mjs`, `npm run team -- --help`, `npm run check:project` (MinGW x64 smoke passed), and `git diff --check` passed. Authenticated `--dry-run` passed while on clean `main`; a later dry-run on the dirty setup feature branch correctly blocked because it requires clean `main`.
 - Next action: commit and open a separate PR for the setup workflow so its Windows MSVC CI can run.
+- Setup workflow PR #2 is open at https://github.com/manualmapped/UserMode-Memory-R-W/pull/2; its `msvc-x64` GitHub Actions job passed. Human review and merge remain pending.
+- Documentation PR #1 is open at https://github.com/manualmapped/UserMode-Memory-R-W/pull/1; it currently reports no checks because the workflow has not reached the base branch.
