@@ -12,6 +12,7 @@ No kernel driver. No inline hooks. No dependencies beyond the Windows SDK.
 - **Driverless** user-mode operation
 - Automatic syscall stub generation at runtime
 - Dynamic syscall ID resolution across Windows versions
+- Independent, move-only process sessions with per-target ownership
 - Concurrent memory operations protected against session shutdown and rebinding
 - Thread-safe initialization and shutdown
 - RAII session management
@@ -77,26 +78,27 @@ Concurrent operations use a shared lock so multiple reads and writes can proceed
 
 int main()
 {
-    mem::ScopedSession session(TEXT("notepad.exe"));
-
-    if (!session)
+    const auto pid = mem::find_process(TEXT("notepad.exe"));
+    if (pid == 0)
     {
-        printf("Initialization failed.\n");
+        printf("Process not found.\n");
         return 1;
     }
 
-    mem::base_addr = mem::get_base_address();
+    mem::ProcessSession session;
+    if (!session.bind(pid))
+    {
+        printf("Could not open process.\n");
+        return 1;
+    }
 
-    printf("Base: 0x%llX\n", mem::base_addr);
+    const auto base = session.base_address();
+    printf("Base: 0x%llX\n", base);
 
-    auto dos = mem::read_memory<IMAGE_DOS_HEADER>(mem::base_addr);
+    auto dos = session.read<IMAGE_DOS_HEADER>(base);
 
     if (dos)
         printf("DOS Header: 0x%X\n", dos->e_magic);
-
-    int value = 42;
-
-    mem::write_memory(mem::base_addr, value);
 
     return 0;
 }
@@ -105,6 +107,28 @@ int main()
 ---
 
 # API
+
+## Independent sessions (recommended)
+
+Each `ProcessSession` owns its target PID, process handle, syscall stubs, and base address. Multiple instances can target different processes at the same time. A session is noncopyable and movable; its destructor releases its resources. Reads and writes can run concurrently on an instance, while `bind()` and `close()` wait for active operations to finish.
+
+```cpp
+mem::ProcessSession first;
+mem::ProcessSession second;
+
+if (!first.bind(pid_a) || !second.bind(pid_b))
+    return 1;
+
+auto a = first.read<int>(address_a);
+auto b = second.read<int>(address_b);
+first.write(address_a, 123);
+```
+
+`bind()` replaces only that instance's target. A failed bind leaves that instance closed. The typed `read<T>` and `write<T>` APIs require trivially copyable types; `read_raw` and `write_raw` handle byte buffers.
+
+## Legacy global API
+
+The original free functions, globals, and `ScopedSession` remain available for source compatibility. They share one process-global target, so use only one active legacy session at a time. New code should use `ProcessSession` to keep targets independent.
 
 ## Global State
 
@@ -266,9 +290,22 @@ Destructor automatically calls `shutdown()`.
 
 # Thread Safety
 
-Library operations coordinate through a shared mutex. Reads, writes, and base-address queries hold shared access while using the process handle and generated syscall stubs. Initialization, rebinding, and shutdown hold exclusive access, so they wait for active operations before replacing or releasing those resources.
+Each `ProcessSession` protects its own handle and generated stubs with a shared mutex. Reads may run together; binding and closing wait for active reads and writes before replacing or releasing resources. Separate sessions can target separate processes independently.
 
-The target process is global to the library. Use one active `ScopedSession` at a time, and do not read or write the exposed global state (`pid`, `process_handle`, syscall pointers, or `base_addr`) directly while library operations are running. `is_ready()` only reports readiness; it does not reserve a session for a following operation.
+The legacy free functions still use shared global state. Use one active `ScopedSession` at a time with that API, and do not access its exposed globals (`pid`, `process_handle`, syscall pointers, or `base_addr`) while operations are running. `is_ready()` only reports readiness; it does not reserve a session for a following operation.
+
+---
+
+# CMake Integration
+
+The library is header-only and exports the `UserModeMemoryRW::UserModeMemoryRW` CMake target. Add this repository with `add_subdirectory` and link that target to a Windows x64 C++17 executable:
+
+```cmake
+add_subdirectory(path/to/UserMode-Memory-R-W)
+target_link_libraries(your_app PRIVATE UserModeMemoryRW::UserModeMemoryRW)
+```
+
+To install the header and exported target files, run `cmake -S . -B build` followed by `cmake --install build --prefix <install-directory>`.
 
 ---
 

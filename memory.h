@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <type_traits>
 #include <optional>
 #include <mutex>
 #include <shared_mutex>
@@ -341,6 +342,212 @@ namespace mem
         std::unique_lock<std::shared_mutex> lock(init_mutex);
         shutdown_impl();
     }
+
+    // An independent process target. Unlike the legacy free functions, each
+    // ProcessSession owns its handle and syscall stubs, so sessions do not
+    // replace one another's target.
+    class ProcessSession
+    {
+    public:
+        ProcessSession() noexcept = default;
+        ~ProcessSession() noexcept { close(); }
+
+        ProcessSession(const ProcessSession&) = delete;
+        ProcessSession& operator=(const ProcessSession&) = delete;
+
+        ProcessSession(ProcessSession&& other) noexcept
+        {
+            std::unique_lock<std::shared_mutex> lock(other.mutex_);
+            move_from_locked(other);
+        }
+
+        ProcessSession& operator=(ProcessSession&& other) noexcept
+        {
+            if (this == &other) return *this;
+            std::unique_lock<std::shared_mutex> left(mutex_, std::defer_lock);
+            std::unique_lock<std::shared_mutex> right(other.mutex_, std::defer_lock);
+            std::lock(left, right);
+            release_locked();
+            move_from_locked(other);
+            return *this;
+        }
+
+        bool bind(INT32 target_pid) noexcept
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            release_locked();
+            if (target_pid <= 0) return false;
+
+            HANDLE handle = OpenProcess(TARGET_RIGHTS, FALSE, static_cast<DWORD>(target_pid));
+            if (!handle) return false;
+
+            void* read_page = nullptr;
+            void* write_page = nullptr;
+            auto cleanup = [&]() noexcept
+            {
+                if (read_page) VirtualFree(read_page, 0, MEM_RELEASE);
+                if (write_page) VirtualFree(write_page, 0, MEM_RELEASE);
+                CloseHandle(handle);
+            };
+
+            HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+            const uint32_t read_id = ntdll ? hidden::scan_id("NtReadVirtualMemory") : 0;
+            const uint32_t write_id = ntdll ? hidden::scan_id("NtWriteVirtualMemory") : 0;
+            if (read_id == 0 || write_id == 0)
+            {
+                cleanup();
+                return false;
+            }
+
+            read_page = hidden::alloc_stub(read_id);
+            if (read_page) write_page = hidden::alloc_stub(write_id);
+            if (!read_page || !write_page)
+            {
+                cleanup();
+                return false;
+            }
+
+            HMODULE modules[64]{};
+            DWORD needed = 0;
+            uintptr_t module_base = 0;
+            if (EnumProcessModules(handle, modules, sizeof(modules), &needed) && needed >= sizeof(HMODULE))
+                module_base = reinterpret_cast<uintptr_t>(modules[0]);
+
+            handle_ = handle;
+            read_stub_ = read_page;
+            write_stub_ = write_page;
+            read_syscall_ = reinterpret_cast<read_fn>(read_stub_);
+            write_syscall_ = reinterpret_cast<write_fn>(write_stub_);
+            pid_ = target_pid;
+            base_addr_ = module_base;
+            return true;
+        }
+
+        bool bind(LPCTSTR executable_name) noexcept
+        {
+            const INT32 target_pid = find_process(executable_name);
+            if (!target_pid)
+            {
+                close();
+                return false;
+            }
+            return bind(target_pid);
+        }
+
+        void close() noexcept
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            release_locked();
+        }
+
+        bool is_open() const noexcept
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            return handle_ != nullptr && read_syscall_ != nullptr && write_syscall_ != nullptr;
+        }
+
+        INT32 process_id() const noexcept
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            return pid_;
+        }
+
+        uintptr_t base_address() const noexcept
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            return base_addr_;
+        }
+
+        template <typename T>
+        std::optional<T> read(uint64_t address) const noexcept
+        {
+            static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::read requires a trivially copyable type");
+            if (!is_valid_range(address, sizeof(T))) return std::nullopt;
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            if (!is_open_locked()) return std::nullopt;
+            T value{};
+            SIZE_T transferred = 0;
+            const NTSTATUS status = read_syscall_(handle_, reinterpret_cast<PVOID>(address), &value, sizeof(T), &transferred);
+            if (status >= 0 && transferred == sizeof(T)) return value;
+            return std::nullopt;
+        }
+
+        template <typename T>
+        bool write(uint64_t address, const T& value) const noexcept
+        {
+            static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::write requires a trivially copyable type");
+            T copy = value;
+            return write_raw(address, &copy, sizeof(T));
+        }
+
+        bool read_raw(uint64_t address, void* data, std::size_t size) const noexcept
+        {
+            if (!data || !is_valid_range(address, size)) return false;
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            if (!is_open_locked()) return false;
+            SIZE_T transferred = 0;
+            const NTSTATUS status = read_syscall_(handle_, reinterpret_cast<PVOID>(address), data, size, &transferred);
+            return status >= 0 && transferred == size;
+        }
+
+        bool write_raw(uint64_t address, const void* data, std::size_t size) const noexcept
+        {
+            if (!data || !is_valid_range(address, size)) return false;
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            if (!is_open_locked()) return false;
+            SIZE_T transferred = 0;
+            const NTSTATUS status = write_syscall_(handle_, reinterpret_cast<PVOID>(address),
+                const_cast<void*>(data), size, &transferred);
+            return status >= 0 && transferred == size;
+        }
+
+    private:
+        bool is_open_locked() const noexcept
+        {
+            return handle_ != nullptr && read_syscall_ != nullptr && write_syscall_ != nullptr;
+        }
+
+        void release_locked() noexcept
+        {
+            if (read_stub_) VirtualFree(read_stub_, 0, MEM_RELEASE);
+            if (write_stub_) VirtualFree(write_stub_, 0, MEM_RELEASE);
+            if (handle_) CloseHandle(handle_);
+            read_stub_ = nullptr;
+            write_stub_ = nullptr;
+            read_syscall_ = nullptr;
+            write_syscall_ = nullptr;
+            handle_ = nullptr;
+            pid_ = 0;
+            base_addr_ = 0;
+        }
+
+        void move_from_locked(ProcessSession& other) noexcept
+        {
+            handle_ = other.handle_;
+            read_stub_ = other.read_stub_;
+            write_stub_ = other.write_stub_;
+            read_syscall_ = other.read_syscall_;
+            write_syscall_ = other.write_syscall_;
+            pid_ = other.pid_;
+            base_addr_ = other.base_addr_;
+            other.handle_ = nullptr;
+            other.read_stub_ = nullptr;
+            other.write_stub_ = nullptr;
+            other.read_syscall_ = nullptr;
+            other.write_syscall_ = nullptr;
+            other.pid_ = 0;
+            other.base_addr_ = 0;
+        }
+
+        mutable std::shared_mutex mutex_;
+        HANDLE handle_ = nullptr;
+        void* read_stub_ = nullptr;
+        void* write_stub_ = nullptr;
+        read_fn read_syscall_ = nullptr;
+        write_fn write_syscall_ = nullptr;
+        INT32 pid_ = 0;
+        uintptr_t base_addr_ = 0;
+    };
 
     class ScopedSession
     {
