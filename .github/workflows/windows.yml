@@ -1,0 +1,61 @@
+name: Windows validation
+
+on:
+  push:
+    branches: [main, "work/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  msvc:
+    name: MSVC x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install
+        run: cmake --install build --config Release --prefix "$env:GITHUB_WORKSPACE/install"
+      - name: Configure installed consumer
+        run: cmake -S tests/installed-consumer -B consumer-build -A x64 -DMEMORY_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/install"
+      - name: Build installed consumer
+        run: cmake --build consumer-build --config Release --parallel
+
+  mingw:
+    name: MinGW-w64 x64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install
+        run: cmake --install build --prefix "$GITHUB_WORKSPACE/install"
+      - name: Configure installed consumer
+        run: cmake -S tests/installed-consumer -B consumer-build -G Ninja -DMEMORY_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+      - name: Build installed consumer
+        run: cmake --build consumer-build --parallel
