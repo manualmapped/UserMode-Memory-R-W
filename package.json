@@ -1,0 +1,22 @@
+{
+  "name": "usermode-memory-r-w",
+  "version": "0.1.0",
+  "description": "Local Codex task orchestration for UserMode-Memory-R-W",
+  "scripts": {
+    "team": "node scripts/codex-team.mjs",
+    "check:project": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-project.ps1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manualmapped/UserMode-Memory-R-W.git"
+  },
+  "private": true,
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/manualmapped/UserMode-Memory-R-W/issues"
+  },
+  "homepage": "https://github.com/manualmapped/UserMode-Memory-R-W#readme",
+  "dependencies": {
+    "@openai/codex-sdk": "0.162.1"
+  }
+}

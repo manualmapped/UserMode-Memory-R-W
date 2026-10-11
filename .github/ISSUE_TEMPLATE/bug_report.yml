@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible defect in the library.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: Provide a minimal reproduction. Do not include secrets or data from processes you are not authorized to inspect.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem
+      description: What happens, and what should happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps or code, with target architecture and toolchain versions.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable conditions that would resolve the issue.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context
+      description: Windows version, compiler/SDK, and relevant error output.
