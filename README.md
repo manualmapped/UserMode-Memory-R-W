@@ -12,7 +12,7 @@ No kernel driver. No inline hooks. No dependencies beyond the Windows SDK.
 - **Driverless** user-mode operation
 - Automatic syscall stub generation at runtime
 - Dynamic syscall ID resolution across Windows versions
-- Lock-free fast path for memory operations
+- Concurrent memory operations protected against session shutdown and rebinding
 - Thread-safe initialization and shutdown
 - RAII session management
 - `std::optional<T>` read interface
@@ -53,7 +53,7 @@ During initialization the library:
 Generated stub:
 
 ```asm
-mov r10, rdx
+mov r10, rcx
 mov eax, syscall_id
 syscall
 ret
@@ -65,28 +65,7 @@ After initialization, every read and write goes directly through the generated s
 
 ## Performance
 
-Release x64 benchmark (MSVC)
-
-| Operation | Average |
-|----------|--------:|
-| `read_memory<int>` | ~256 ns |
-| `write_memory<int>` | ~254 ns |
-| `write_raw` | ~259 ns |
-
-Concurrent validation:
-
-- 4 reader threads
-- 1 writer thread
-- 500 iterations per thread
-
-Results:
-
-- 2000 / 2000 successful reads
-- 500 / 500 successful writes
-- No races
-- No crashes
-
-The remaining latency is almost entirely the kernel transition itself.
+Concurrent operations use a shared lock so multiple reads and writes can proceed together. Initialization, rebinding, and shutdown take exclusive access and wait for active operations to finish. This adds synchronization overhead; benchmark results are not currently published.
 
 ---
 
@@ -287,13 +266,9 @@ Destructor automatically calls `shutdown()`.
 
 # Thread Safety
 
-Memory operations are safe for concurrent use.
+Library operations coordinate through a shared mutex. Reads, writes, and base-address queries hold shared access while using the process handle and generated syscall stubs. Initialization, rebinding, and shutdown hold exclusive access, so they wait for active operations before replacing or releasing those resources.
 
-Fast-path reads and writes require only a single atomic acquire load and avoid mutex contention during normal operation.
-
-Initialization and shutdown are serialized internally and wait for active operations to finish before releasing resources.
-
-Validated under concurrent stress testing with multiple reader and writer threads.
+The target process is global to the library. Use one active `ScopedSession` at a time, and do not read or write the exposed global state (`pid`, `process_handle`, syscall pointers, or `base_addr`) directly while library operations are running. `is_ready()` only reports readiness; it does not reserve a session for a following operation.
 
 ---
 
@@ -306,7 +281,7 @@ read_memory()
 
         ▼
 
-ready.load()
+shared session lock
 
         │
 
@@ -318,7 +293,7 @@ read_syscall()
 
         ▼
 
-mov r10, rdx
+mov r10, rcx
 mov eax, syscall_id
 syscall
 ret
@@ -376,14 +351,14 @@ Ready
 
 # Compatibility
 
-| Windows Version | Supported |
+| Windows Version | Verification |
 |----------------|-----------|
-| Windows 7 | ✓ |
-| Windows 8 | ✓ |
-| Windows 10 | ✓ |
-| Windows 11 | ✓ |
+| Windows 7 | Not verified |
+| Windows 8 | Not verified |
+| Windows 10 | Not verified |
+| Windows 11 | Not verified |
 
-Syscall numbers are resolved dynamically at runtime, allowing compatibility across supported Windows releases.
+Syscall numbers are resolved dynamically at runtime. Compatibility still depends on OS behavior and should be verified on the target system; the project does not currently provide automated tests across these Windows versions.
 
 ---
 

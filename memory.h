@@ -9,6 +9,7 @@
 #include <cstring>
 #include <optional>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 
 namespace mem
@@ -25,7 +26,7 @@ namespace mem
     inline read_fn read_syscall = nullptr;
     inline write_fn write_syscall = nullptr;
     inline std::atomic<bool> ready{false};
-    inline std::mutex init_mutex;
+    inline std::shared_mutex init_mutex;
 
     constexpr uintptr_t MIN_ADDRESS = 0x10000;
     constexpr uintptr_t MAX_ADDRESS = 0x7FFFFFFFFFFF;
@@ -35,6 +36,8 @@ namespace mem
 
     __forceinline INT32 find_process(LPCTSTR name) noexcept
     {
+        if (!name) return 0;
+
         PROCESSENTRY32 entry{};
         entry.dwSize = sizeof(entry);
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -57,7 +60,7 @@ namespace mem
 
     __forceinline uintptr_t get_base_address() noexcept
     {
-        std::lock_guard<std::mutex> lock(init_mutex);
+        std::shared_lock<std::shared_mutex> lock(init_mutex);
 
         HANDLE h = process_handle;
         bool local_handle = false;
@@ -84,6 +87,14 @@ namespace mem
     __forceinline bool is_valid(uintptr_t address) noexcept
     {
         return address >= MIN_ADDRESS && address <= MAX_ADDRESS;
+    }
+
+    __forceinline bool is_valid_range(uint64_t address, std::size_t size) noexcept
+    {
+        if (size == 0 || address > static_cast<uint64_t>(MAX_ADDRESS)) return false;
+        const uint64_t last_offset = static_cast<uint64_t>(size - 1);
+        if (last_offset > static_cast<uint64_t>(MAX_ADDRESS) - address) return false;
+        return address >= MIN_ADDRESS && address + last_offset <= MAX_ADDRESS;
     }
 
     __forceinline bool is_ready() noexcept
@@ -168,9 +179,17 @@ namespace mem
 
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(bytes, &mbi, sizeof(mbi))) return 0;
+            const DWORD protection = mbi.Protect & 0xFF;
+            const bool readable = protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+                protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || !readable) return 0;
 
-            uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            uintptr_t region_start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            if (mbi.RegionSize > UINTPTR_MAX - region_start) return 0;
+            uintptr_t region_end = region_start + mbi.RegionSize;
             uintptr_t func_start = reinterpret_cast<uintptr_t>(bytes);
+            if (func_start < region_start || func_start >= region_end) return 0;
             SIZE_T safe_remaining = region_end - func_start;
             int limit = static_cast<int>(safe_remaining < static_cast<SIZE_T>(SCAN_DEPTH) ? safe_remaining : static_cast<SIZE_T>(SCAN_DEPTH));
 
@@ -181,8 +200,12 @@ namespace mem
                     int low = (i - LOOKBACK_MAX) > 0 ? (i - LOOKBACK_MAX) : 0;
                     for (int j = i - 1; j >= low; --j)
                     {
-                        if (bytes[j] == 0xB8)
-                            return *reinterpret_cast<const uint32_t*>(bytes + j + 1);
+                        if (bytes[j] == 0xB8 && j + 5 <= i)
+                        {
+                            uint32_t syscall_id = 0;
+                            memcpy(&syscall_id, bytes + j + 1, sizeof(syscall_id));
+                            return syscall_id;
+                        }
                     }
                     break;
                 }
@@ -203,11 +226,23 @@ namespace mem
             if (!process_handle) return false;
         }
 
+        auto cleanup = []() noexcept
+        {
+            ready.store(false, std::memory_order_release);
+            read_syscall = nullptr;
+            write_syscall = nullptr;
+            if (read_stub) VirtualFree(read_stub, 0, MEM_RELEASE);
+            if (write_stub) VirtualFree(write_stub, 0, MEM_RELEASE);
+            read_stub = nullptr;
+            write_stub = nullptr;
+            if (process_handle) CloseHandle(process_handle);
+            process_handle = nullptr;
+        };
+
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         if (!ntdll)
         {
-            CloseHandle(process_handle);
-            process_handle = nullptr;
+            cleanup();
             return false;
         }
 
@@ -216,8 +251,7 @@ namespace mem
 
         if (rid == 0 || wid == 0)
         {
-            CloseHandle(process_handle);
-            process_handle = nullptr;
+            cleanup();
             return false;
         }
 
@@ -226,18 +260,7 @@ namespace mem
 
         if (!read_stub || !write_stub)
         {
-            if (read_stub)
-            {
-                VirtualFree(read_stub, 0, MEM_RELEASE);
-                read_stub = nullptr;
-            }
-            if (write_stub)
-            {
-                VirtualFree(write_stub, 0, MEM_RELEASE);
-                write_stub = nullptr;
-            }
-            CloseHandle(process_handle);
-            process_handle = nullptr;
+            cleanup();
             return false;
         }
 
@@ -250,68 +273,42 @@ namespace mem
 
     inline bool initialize() noexcept
     {
-        std::lock_guard<std::mutex> lock(init_mutex);
+        std::unique_lock<std::shared_mutex> lock(init_mutex);
         return initialize_impl();
     }
 
     template <typename T>
     __forceinline std::optional<T> read_memory(uint64_t address) noexcept
     {
-        if (ready.load(std::memory_order_acquire))
+        if (!is_valid_range(address, sizeof(T))) return std::nullopt;
+
+        std::shared_lock<std::shared_mutex> lock(init_mutex);
+        if (!ready.load(std::memory_order_acquire))
         {
-            T value;
-            SIZE_T fetched;
-            NTSTATUS status = read_syscall(
-                process_handle,
-                reinterpret_cast<PVOID>(address),
-                &value,
-                sizeof(T),
-                &fetched
-            );
-
-            if (status >= 0)
-            {
-                if (fetched == sizeof(T))
-                    return value;
-            }
-
-            return std::nullopt;
+            lock.unlock();
+            std::unique_lock<std::shared_mutex> init_lock(init_mutex);
+            if (!ready.load(std::memory_order_relaxed) && !initialize_impl()) return std::nullopt;
+            init_lock.unlock();
+            lock.lock();
         }
-
-        std::lock_guard<std::mutex> lock(init_mutex);
-        if (!is_valid(address)) return std::nullopt;
-        if (!ready.load(std::memory_order_relaxed) && !initialize_impl())
-            return std::nullopt;
-
+        if (!ready.load(std::memory_order_acquire)) return std::nullopt;
         return detail::read_io<T>(address);
     }
 
     __forceinline bool write_raw(uint64_t address, void* data, std::size_t size) noexcept
     {
-        if (!data || size == 0) return false;
+        if (!data || !is_valid_range(address, size)) return false;
 
-        if (ready.load(std::memory_order_acquire))
+        std::shared_lock<std::shared_mutex> lock(init_mutex);
+        if (!ready.load(std::memory_order_acquire))
         {
-            SIZE_T pushed;
-            NTSTATUS status = write_syscall(
-                process_handle,
-                reinterpret_cast<PVOID>(address),
-                data,
-                size,
-                &pushed
-            );
-
-            if (status >= 0)
-                return (pushed == size);
-
-            return false;
+            lock.unlock();
+            std::unique_lock<std::shared_mutex> init_lock(init_mutex);
+            if (!ready.load(std::memory_order_relaxed) && !initialize_impl()) return false;
+            init_lock.unlock();
+            lock.lock();
         }
-
-        std::lock_guard<std::mutex> lock(init_mutex);
-        if (!is_valid(address)) return false;
-        if (!ready.load(std::memory_order_relaxed) && !initialize_impl())
-            return false;
-
+        if (!ready.load(std::memory_order_acquire)) return false;
         return detail::write_io(address, data, size);
     }
 
@@ -326,11 +323,14 @@ namespace mem
     {
         ready.store(false, std::memory_order_release);
 
-        if (process_handle)
-        {
-            CloseHandle(process_handle);
-            process_handle = nullptr;
-        }
+        read_syscall = nullptr;
+        write_syscall = nullptr;
+        if (read_stub) VirtualFree(read_stub, 0, MEM_RELEASE);
+        if (write_stub) VirtualFree(write_stub, 0, MEM_RELEASE);
+        read_stub = nullptr;
+        write_stub = nullptr;
+        if (process_handle) CloseHandle(process_handle);
+        process_handle = nullptr;
 
         pid = 0;
         base_addr = 0;
@@ -338,7 +338,7 @@ namespace mem
 
     inline void shutdown() noexcept
     {
-        std::lock_guard<std::mutex> lock(init_mutex);
+        std::unique_lock<std::shared_mutex> lock(init_mutex);
         shutdown_impl();
     }
 
@@ -349,7 +349,7 @@ namespace mem
 
         explicit ScopedSession(INT32 target_pid) noexcept
         {
-            std::lock_guard<std::mutex> lock(init_mutex);
+            std::unique_lock<std::shared_mutex> lock(init_mutex);
             shutdown_impl();
             pid = target_pid;
             active = initialize_impl();
@@ -357,7 +357,7 @@ namespace mem
 
         explicit ScopedSession(LPCTSTR target_name) noexcept
         {
-            std::lock_guard<std::mutex> lock(init_mutex);
+            std::unique_lock<std::shared_mutex> lock(init_mutex);
             shutdown_impl();
             INT32 found = find_process(target_name);
             if (found != 0)
@@ -379,7 +379,7 @@ namespace mem
 
         bool bind(INT32 target_pid) noexcept
         {
-            std::lock_guard<std::mutex> lock(init_mutex);
+            std::unique_lock<std::shared_mutex> lock(init_mutex);
             shutdown_impl();
             pid = target_pid;
             active = initialize_impl();
@@ -388,7 +388,7 @@ namespace mem
 
         bool bind(LPCTSTR target_name) noexcept
         {
-            std::lock_guard<std::mutex> lock(init_mutex);
+            std::unique_lock<std::shared_mutex> lock(init_mutex);
             shutdown_impl();
             INT32 found = find_process(target_name);
             if (found == 0) return false;

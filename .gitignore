@@ -1,24 +1,10 @@
-# Secrets and machine-local configuration
-.env
-.env.*
+# Keep personal development material out of this repository by storing it in INSTRUCTIONS/.
+INSTRUCTIONS/
+
+# Ignore local settings and generated output.
+.env*
 !.env.example
-
-# Private development notes and local workflow state
-.codex/
-.local/
-.worktrees/
-worktrees/
-TEAM.md
-AGENTS.md
-TASK.md
-WORKLOG.md
-PROJECT_BRIEF.md
-ARCHITECTURE.md
-DECISIONS.md
-
-# Local automation and generated dependencies
-.github/
-scripts/
+.*/
 node_modules/
-package.json
-package-lock.json
+build/
+dist/
