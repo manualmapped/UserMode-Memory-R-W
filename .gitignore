@@ -1,10 +1,12 @@
-# Keep personal development material out of this repository by storing it in INSTRUCTIONS/.
+# Local development metadata and private project materials stay local.
+.*
+!.github/
+!.github/**
 INSTRUCTIONS/
 
 # Ignore local settings and generated output.
 .env*
 !.env.example
-.*/
 node_modules/
 build/
 dist/

@@ -35,6 +35,60 @@ namespace mem
     constexpr int SCAN_DEPTH = 64;
     constexpr int LOOKBACK_MAX = 32;
 
+    // ProcessSession uses documented Win32 transfers. The legacy global API
+    // below remains available for source compatibility.
+    enum class AccessMode
+    {
+        read_only,
+        read_write
+    };
+
+    enum class TransferStatus
+    {
+        complete,
+        partial,
+        invalid_range,
+        invalid_buffer,
+        not_open,
+        access_denied,
+        operating_system_error
+    };
+
+    struct TransferResult
+    {
+        std::size_t requested = 0;
+        std::size_t transferred = 0;
+        DWORD os_error = ERROR_SUCCESS;
+        TransferStatus status = TransferStatus::not_open;
+
+        bool complete() const noexcept
+        {
+            return status == TransferStatus::complete && transferred == requested;
+        }
+
+        explicit operator bool() const noexcept { return complete(); }
+    };
+
+    struct ReadRequest
+    {
+        uint64_t address = 0;
+        void* buffer = nullptr;
+        std::size_t size = 0;
+    };
+
+    struct MemoryRegion
+    {
+        uintptr_t base_address = 0;
+        uintptr_t allocation_base = 0;
+        std::size_t size = 0;
+        DWORD state = 0;
+        DWORD protection = 0;
+        DWORD type = 0;
+    };
+
+    constexpr std::size_t MAX_READ_MANY_RANGES = 256;
+    constexpr std::size_t MAX_READ_MANY_BYTES = 16 * 1024 * 1024;
+
     __forceinline INT32 find_process(LPCTSTR name) noexcept
     {
         if (!name) return 0;
@@ -344,8 +398,7 @@ namespace mem
     }
 
     // An independent process target. Unlike the legacy free functions, each
-    // ProcessSession owns its handle and syscall stubs, so sessions do not
-    // replace one another's target.
+    // ProcessSession owns its handle and does not replace another target.
     class ProcessSession
     {
     public:
@@ -374,38 +427,20 @@ namespace mem
 
         bool bind(INT32 target_pid) noexcept
         {
+            return bind(target_pid, AccessMode::read_write);
+        }
+
+        bool bind(INT32 target_pid, AccessMode mode) noexcept
+        {
             std::unique_lock<std::shared_mutex> lock(mutex_);
             release_locked();
-            if (target_pid <= 0) return false;
+            if (target_pid <= 0 || (mode != AccessMode::read_only && mode != AccessMode::read_write)) return false;
 
-            HANDLE handle = OpenProcess(TARGET_RIGHTS, FALSE, static_cast<DWORD>(target_pid));
+            DWORD rights = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
+            if (mode == AccessMode::read_write)
+                rights |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            HANDLE handle = OpenProcess(rights, FALSE, static_cast<DWORD>(target_pid));
             if (!handle) return false;
-
-            void* read_page = nullptr;
-            void* write_page = nullptr;
-            auto cleanup = [&]() noexcept
-            {
-                if (read_page) VirtualFree(read_page, 0, MEM_RELEASE);
-                if (write_page) VirtualFree(write_page, 0, MEM_RELEASE);
-                CloseHandle(handle);
-            };
-
-            HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-            const uint32_t read_id = ntdll ? hidden::scan_id("NtReadVirtualMemory") : 0;
-            const uint32_t write_id = ntdll ? hidden::scan_id("NtWriteVirtualMemory") : 0;
-            if (read_id == 0 || write_id == 0)
-            {
-                cleanup();
-                return false;
-            }
-
-            read_page = hidden::alloc_stub(read_id);
-            if (read_page) write_page = hidden::alloc_stub(write_id);
-            if (!read_page || !write_page)
-            {
-                cleanup();
-                return false;
-            }
 
             HMODULE modules[64]{};
             DWORD needed = 0;
@@ -414,16 +449,18 @@ namespace mem
                 module_base = reinterpret_cast<uintptr_t>(modules[0]);
 
             handle_ = handle;
-            read_stub_ = read_page;
-            write_stub_ = write_page;
-            read_syscall_ = reinterpret_cast<read_fn>(read_stub_);
-            write_syscall_ = reinterpret_cast<write_fn>(write_stub_);
             pid_ = target_pid;
             base_addr_ = module_base;
+            access_mode_ = mode;
             return true;
         }
 
         bool bind(LPCTSTR executable_name) noexcept
+        {
+            return bind(executable_name, AccessMode::read_write);
+        }
+
+        bool bind(LPCTSTR executable_name, AccessMode mode) noexcept
         {
             const INT32 target_pid = find_process(executable_name);
             if (!target_pid)
@@ -431,7 +468,7 @@ namespace mem
                 close();
                 return false;
             }
-            return bind(target_pid);
+            return bind(target_pid, mode);
         }
 
         void close() noexcept
@@ -443,7 +480,13 @@ namespace mem
         bool is_open() const noexcept
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
-            return handle_ != nullptr && read_syscall_ != nullptr && write_syscall_ != nullptr;
+            return handle_ != nullptr;
+        }
+
+        AccessMode access_mode() const noexcept
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            return access_mode_;
         }
 
         INT32 process_id() const noexcept
@@ -462,14 +505,17 @@ namespace mem
         std::optional<T> read(uint64_t address) const noexcept
         {
             static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::read requires a trivially copyable type");
-            if (!is_valid_range(address, sizeof(T))) return std::nullopt;
-            std::shared_lock<std::shared_mutex> lock(mutex_);
-            if (!is_open_locked()) return std::nullopt;
             T value{};
-            SIZE_T transferred = 0;
-            const NTSTATUS status = read_syscall_(handle_, reinterpret_cast<PVOID>(address), &value, sizeof(T), &transferred);
-            if (status >= 0 && transferred == sizeof(T)) return value;
+            const TransferResult result = read_raw_result(address, &value, sizeof(T));
+            if (result.complete()) return value;
             return std::nullopt;
+        }
+
+        template <typename T>
+        TransferResult read_result(uint64_t address, T& value) const noexcept
+        {
+            static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::read_result requires a trivially copyable type");
+            return read_raw_result(address, &value, sizeof(T));
         }
 
         template <typename T>
@@ -477,76 +523,148 @@ namespace mem
         {
             static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::write requires a trivially copyable type");
             T copy = value;
-            return write_raw(address, &copy, sizeof(T));
+            return write_raw_result(address, &copy, sizeof(T)).complete();
+        }
+
+        template <typename T>
+        TransferResult write_result(uint64_t address, const T& value) const noexcept
+        {
+            static_assert(std::is_trivially_copyable<T>::value, "ProcessSession::write_result requires a trivially copyable type");
+            T copy = value;
+            return write_raw_result(address, &copy, sizeof(T));
+        }
+
+        TransferResult read_raw_result(uint64_t address, void* data, std::size_t size) const noexcept
+        {
+            if (!data) return { size, 0, ERROR_INVALID_PARAMETER, TransferStatus::invalid_buffer };
+            if (!is_valid_range(address, size)) return { size, 0, ERROR_INVALID_ADDRESS, TransferStatus::invalid_range };
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            return read_raw_locked(address, data, size);
         }
 
         bool read_raw(uint64_t address, void* data, std::size_t size) const noexcept
         {
-            if (!data || !is_valid_range(address, size)) return false;
+            return read_raw_result(address, data, size).complete();
+        }
+
+        TransferResult write_raw_result(uint64_t address, const void* data, std::size_t size) const noexcept
+        {
+            if (!data) return { size, 0, ERROR_INVALID_PARAMETER, TransferStatus::invalid_buffer };
+            if (!is_valid_range(address, size)) return { size, 0, ERROR_INVALID_ADDRESS, TransferStatus::invalid_range };
             std::shared_lock<std::shared_mutex> lock(mutex_);
-            if (!is_open_locked()) return false;
-            SIZE_T transferred = 0;
-            const NTSTATUS status = read_syscall_(handle_, reinterpret_cast<PVOID>(address), data, size, &transferred);
-            return status >= 0 && transferred == size;
+            return write_raw_locked(address, data, size);
         }
 
         bool write_raw(uint64_t address, const void* data, std::size_t size) const noexcept
         {
-            if (!data || !is_valid_range(address, size)) return false;
+            return write_raw_result(address, data, size).complete();
+        }
+
+        // At most MAX_READ_MANY_RANGES and MAX_READ_MANY_BYTES are accepted.
+        // For an accepted batch, results are written in input order, one per
+        // range. A failed range does not prevent later ranges from running.
+        bool read_many(const ReadRequest* requests, TransferResult* results, std::size_t count) const noexcept
+        {
+            if (count == 0) return true;
+            if (!requests || !results || count > MAX_READ_MANY_RANGES) return false;
+            std::size_t total = 0;
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                if (requests[i].size > MAX_READ_MANY_BYTES - total) return false;
+                total += requests[i].size;
+            }
             std::shared_lock<std::shared_mutex> lock(mutex_);
-            if (!is_open_locked()) return false;
-            SIZE_T transferred = 0;
-            const NTSTATUS status = write_syscall_(handle_, reinterpret_cast<PVOID>(address),
-                const_cast<void*>(data), size, &transferred);
-            return status >= 0 && transferred == size;
+            for (std::size_t i = 0; i < count; ++i)
+                results[i] = read_raw_locked(requests[i].address, requests[i].buffer, requests[i].size);
+            return true;
+        }
+
+        // Region metadata is advisory; every transfer result remains
+        // authoritative because mappings and protections can change.
+        DWORD query_region(uint64_t address, MemoryRegion& region) const noexcept
+        {
+            region = {};
+            if (!is_valid(address)) return ERROR_INVALID_ADDRESS;
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            if (!is_open_locked()) return ERROR_INVALID_HANDLE;
+            MEMORY_BASIC_INFORMATION info{};
+            const SIZE_T queried = VirtualQueryEx(handle_, reinterpret_cast<LPCVOID>(address), &info, sizeof(info));
+            if (queried == 0) return GetLastError();
+            region.base_address = reinterpret_cast<uintptr_t>(info.BaseAddress);
+            region.allocation_base = reinterpret_cast<uintptr_t>(info.AllocationBase);
+            region.size = info.RegionSize;
+            region.state = info.State;
+            region.protection = info.Protect;
+            region.type = info.Type;
+            return ERROR_SUCCESS;
         }
 
     private:
         bool is_open_locked() const noexcept
         {
-            return handle_ != nullptr && read_syscall_ != nullptr && write_syscall_ != nullptr;
+            return handle_ != nullptr;
+        }
+
+        TransferResult read_raw_locked(uint64_t address, void* data, std::size_t size) const noexcept
+        {
+            if (!data) return { size, 0, ERROR_INVALID_PARAMETER, TransferStatus::invalid_buffer };
+            if (!is_valid_range(address, size)) return { size, 0, ERROR_INVALID_ADDRESS, TransferStatus::invalid_range };
+            if (!is_open_locked()) return { size, 0, ERROR_INVALID_HANDLE, TransferStatus::not_open };
+            SIZE_T transferred = 0;
+            const BOOL ok = ReadProcessMemory(handle_, reinterpret_cast<LPCVOID>(address), data, size, &transferred);
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            return make_transfer_result(size, transferred, ok, error);
+        }
+
+        TransferResult write_raw_locked(uint64_t address, const void* data, std::size_t size) const noexcept
+        {
+            if (!data) return { size, 0, ERROR_INVALID_PARAMETER, TransferStatus::invalid_buffer };
+            if (!is_valid_range(address, size)) return { size, 0, ERROR_INVALID_ADDRESS, TransferStatus::invalid_range };
+            if (!is_open_locked()) return { size, 0, ERROR_INVALID_HANDLE, TransferStatus::not_open };
+            if (access_mode_ != AccessMode::read_write)
+                return { size, 0, ERROR_ACCESS_DENIED, TransferStatus::access_denied };
+            SIZE_T transferred = 0;
+            const BOOL ok = WriteProcessMemory(handle_, reinterpret_cast<LPVOID>(address), data, size, &transferred);
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            return make_transfer_result(size, transferred, ok, error);
+        }
+
+        static TransferResult make_transfer_result(std::size_t requested, SIZE_T transferred, BOOL api_success, DWORD error) noexcept
+        {
+            const std::size_t actual = static_cast<std::size_t>(transferred);
+            if (!api_success)
+                return { requested, actual, error, TransferStatus::operating_system_error };
+            if (actual != requested)
+                return { requested, actual, ERROR_SUCCESS, TransferStatus::partial };
+            return { requested, actual, ERROR_SUCCESS, TransferStatus::complete };
         }
 
         void release_locked() noexcept
         {
-            if (read_stub_) VirtualFree(read_stub_, 0, MEM_RELEASE);
-            if (write_stub_) VirtualFree(write_stub_, 0, MEM_RELEASE);
             if (handle_) CloseHandle(handle_);
-            read_stub_ = nullptr;
-            write_stub_ = nullptr;
-            read_syscall_ = nullptr;
-            write_syscall_ = nullptr;
             handle_ = nullptr;
             pid_ = 0;
             base_addr_ = 0;
+            access_mode_ = AccessMode::read_only;
         }
 
         void move_from_locked(ProcessSession& other) noexcept
         {
             handle_ = other.handle_;
-            read_stub_ = other.read_stub_;
-            write_stub_ = other.write_stub_;
-            read_syscall_ = other.read_syscall_;
-            write_syscall_ = other.write_syscall_;
             pid_ = other.pid_;
             base_addr_ = other.base_addr_;
+            access_mode_ = other.access_mode_;
             other.handle_ = nullptr;
-            other.read_stub_ = nullptr;
-            other.write_stub_ = nullptr;
-            other.read_syscall_ = nullptr;
-            other.write_syscall_ = nullptr;
             other.pid_ = 0;
             other.base_addr_ = 0;
+            other.access_mode_ = AccessMode::read_only;
         }
 
         mutable std::shared_mutex mutex_;
         HANDLE handle_ = nullptr;
-        void* read_stub_ = nullptr;
-        void* write_stub_ = nullptr;
-        read_fn read_syscall_ = nullptr;
-        write_fn write_syscall_ = nullptr;
         INT32 pid_ = 0;
         uintptr_t base_addr_ = 0;
+        AccessMode access_mode_ = AccessMode::read_only;
     };
 
     class ScopedSession

@@ -21,3 +21,11 @@ install(EXPORT UserModeMemoryRWTargets
     NAMESPACE UserModeMemoryRW::
     DESTINATION lib/cmake/UserModeMemoryRW
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(process_session_integration tests/process_session_integration.cpp)
+    target_link_libraries(process_session_integration PRIVATE UserModeMemoryRW::UserModeMemoryRW)
+    add_test(NAME process_session_integration COMMAND process_session_integration)
+    set_tests_properties(process_session_integration PROPERTIES TIMEOUT 30)
+endif()
