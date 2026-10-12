@@ -10,3 +10,4 @@ INSTRUCTIONS/
 node_modules/
 build/
 dist/
+benchmarks/vendor/

@@ -574,6 +574,55 @@ namespace mem
                 total += requests[i].size;
             }
             std::shared_lock<std::shared_mutex> lock(mutex_);
+
+            // Adjacent source and destination ranges can share one Win32
+            // transfer. If the combined transfer is not wholly successful,
+            // fall back to individual calls so each request retains its own
+            // result and failure boundary.
+#if !defined(UMRW_DISABLE_READ_MANY_COALESCING)
+            if (count > 1 && is_open_locked())
+            {
+                bool contiguous = true;
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    if (!requests[i].buffer || requests[i].size == 0 ||
+                        !is_valid_range(requests[i].address, requests[i].size))
+                    {
+                        contiguous = false;
+                        break;
+                    }
+                    if (i > 0)
+                    {
+                        const ReadRequest& previous = requests[i - 1];
+                        const uintptr_t previous_buffer = reinterpret_cast<uintptr_t>(previous.buffer);
+                        if (previous.size > UINT64_MAX - previous.address ||
+                            previous.address + previous.size != requests[i].address ||
+                            previous.size > UINTPTR_MAX - previous_buffer ||
+                            previous_buffer + previous.size != reinterpret_cast<uintptr_t>(requests[i].buffer))
+                        {
+                            contiguous = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (contiguous)
+                {
+                    SIZE_T transferred = 0;
+                    const BOOL ok = ReadProcessMemory(handle_,
+                        reinterpret_cast<LPCVOID>(requests[0].address), requests[0].buffer,
+                        total, &transferred);
+                    if (ok && transferred == total)
+                    {
+                        for (std::size_t i = 0; i < count; ++i)
+                            results[i] = { requests[i].size, requests[i].size,
+                                ERROR_SUCCESS, TransferStatus::complete };
+                        return true;
+                    }
+                }
+            }
+#endif
+
             for (std::size_t i = 0; i < count; ++i)
                 results[i] = read_raw_locked(requests[i].address, requests[i].buffer, requests[i].size);
             return true;

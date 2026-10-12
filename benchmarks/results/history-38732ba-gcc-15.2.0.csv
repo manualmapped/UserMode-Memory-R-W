@@ -1,0 +1,14 @@
+# historical source revision; initialized old global Nt* API state; startup excluded; valid owned child
+# this API returns typed values by value; sizes above 64 KiB are excluded to avoid its large stack frame
+api,operation,bytes_per_range,ranges,median_ns_per_range,p95_ns_per_range,ops_per_second,mib_per_second,samples
+historical_nt,read,4,1,543.40,633.25,1840265.01,7.02,7
+historical_nt,write,4,1,538.95,609.70,1855459.69,7.08,7
+historical_nt,read,8,1,520.25,587.85,1922152.83,14.66,7
+historical_nt,write,8,1,517.40,592.45,1932740.64,14.75,7
+historical_nt,read,64,1,526.65,561.45,1898794.26,115.89,7
+historical_nt,write,64,1,516.70,668.20,1935359.02,118.12,7
+historical_nt,read,4096,1,1004.60,1132.50,995421.06,3888.36,7
+historical_nt,write,4096,1,993.75,1130.30,1006289.31,3930.82,7
+historical_nt,read,65536,1,6105.66,6702.15,163782.35,10236.40,7
+historical_nt,write,65536,1,3783.20,4598.24,264326.28,16520.39,7
+# validation=completed_on_valid_ranges
