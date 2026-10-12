@@ -68,7 +68,7 @@ Raw APIs are `read_raw_result(address, buffer, size)` and `write_raw_result(addr
 
 `query_region(address, region)` wraps `VirtualQueryEx` and returns a Win32 error code (`ERROR_SUCCESS` on success). Region metadata is advisory: process mappings and protections may change before a subsequent transfer, whose result remains authoritative.
 
-`read_many(requests, results, count)` performs sequential reads into caller-owned buffers and writes one `TransferResult` per request in order. Accepted batches are limited to 256 ranges and 16 MiB aggregate requested bytes. A failed range does not suppress later ranges. If the count or byte limit is exceeded, it returns `false` without performing reads or modifying results.
+`read_many(requests, results, count)` writes one `TransferResult` per request in order. Accepted batches are limited to 256 ranges and 16 MiB aggregate requested bytes. Adjacent remote ranges with adjacent caller buffers can share one Win32 transfer when that combined transfer fully succeeds. Otherwise, the method reads each range separately, so a failed range does not suppress later ranges. If the count or byte limit is exceeded, it returns `false` without performing reads or modifying results.
 
 Sessions own their process handle. They are movable and noncopyable. Reads may run concurrently; bind, close, move, and multi-range reads synchronize on the session so one batch cannot switch targets midway through.
 

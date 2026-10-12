@@ -14,6 +14,7 @@ static_assert(sizeof(void*) == 8, "This integration test requires Windows x64.")
 namespace
 {
     int child_value = 42;
+    int child_values[] = { 42, 43, 44 };
 
     struct ChildProcess
     {
@@ -131,6 +132,8 @@ int main(int argc, char** argv)
     const uintptr_t local_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     const uintptr_t value_address = child_reader.base_address() +
         (reinterpret_cast<uintptr_t>(&child_value) - local_base);
+    const uintptr_t values_address = child_reader.base_address() +
+        (reinterpret_cast<uintptr_t>(child_values) - local_base);
     int value = 0;
     auto read = child_reader.read_result(value_address, value);
     if (!read.complete() || value != 42)
@@ -161,6 +164,19 @@ int main(int argc, char** argv)
         results[1].status != mem::TransferStatus::invalid_range || !results[2].complete())
         return fail(14, "bounded batch did not report one independent result per range");
 
+    int contiguous_values[3]{};
+    mem::ReadRequest contiguous_requests[] = {
+        { values_address, &contiguous_values[0], sizeof(int) },
+        { values_address + sizeof(int), &contiguous_values[1], sizeof(int) },
+        { values_address + 2 * sizeof(int), &contiguous_values[2], sizeof(int) },
+    };
+    mem::TransferResult contiguous_results[3]{};
+    if (!child_reader.read_many(contiguous_requests, contiguous_results, 3) ||
+        !contiguous_results[0].complete() || !contiguous_results[1].complete() ||
+        !contiguous_results[2].complete() || contiguous_values[0] != 42 ||
+        contiguous_values[1] != 43 || contiguous_values[2] != 44)
+        return fail(34, "contiguous batch did not report and copy every requested range");
+
     mem::ReadRequest oversized[mem::MAX_READ_MANY_RANGES + 1]{};
     mem::TransferResult oversized_results[mem::MAX_READ_MANY_RANGES + 1]{};
     if (child_reader.read_many(oversized, oversized_results, mem::MAX_READ_MANY_RANGES + 1))
@@ -180,6 +196,16 @@ int main(int argc, char** argv)
     auto inaccessible = child_reader.read_raw_result(inaccessible_address, bytes, sizeof(bytes));
     if (inaccessible.complete() || inaccessible.os_error == ERROR_SUCCESS)
         return fail(18, "inaccessible child address did not preserve a Win32 error");
+    int inaccessible_values[2]{};
+    mem::ReadRequest adjacent_inaccessible[] = {
+        { inaccessible_address, &inaccessible_values[0], sizeof(int) },
+        { inaccessible_address + sizeof(int), &inaccessible_values[1], sizeof(int) },
+    };
+    mem::TransferResult adjacent_inaccessible_results[2]{};
+    if (!child_reader.read_many(adjacent_inaccessible, adjacent_inaccessible_results, 2) ||
+        adjacent_inaccessible_results[0].status != mem::TransferStatus::operating_system_error ||
+        adjacent_inaccessible_results[1].status != mem::TransferStatus::operating_system_error)
+        return fail(35, "failed contiguous batch did not fall back to independent range results");
     auto inaccessible_write = child_writer.write_raw_result(inaccessible_address, bytes, sizeof(bytes));
     if (inaccessible_write.complete() || inaccessible_write.os_error == ERROR_SUCCESS)
         return fail(26, "failed child write did not preserve a Win32 error");
